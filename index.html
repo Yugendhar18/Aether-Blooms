@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aether Blooms: The Living Isle</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Added for the new discovered island animation */
+        @keyframes float {
+            0% { transform: translateY(0px); }
+            50% { transform: translateY(-15px); }
+            100% { transform: translateY(0px); }
+        }
+        .animate-float {
+            animation: float 4s ease-in-out infinite;
+        }
+    </style>
+    <!-- Load Firebase Modules -->
+    <script type="module">
+        // --- IMPORTANT ---
+        // Your Firebase config has been added below.
+        const firebaseConfig = {
+          apiKey: "AIzaSyB3JYccGGl7wkksvaXnz3XrXYs0frN5A2o",
+          authDomain: "aetherbloomsgame.firebaseapp.com",
+          projectId: "aetherbloomsgame",
+          storageBucket: "aetherbloomsgame.firebasestorage.app",
+          messagingSenderId: "7815855008",
+          appId: "1:7815855008:web:2020249de036fe4b52ab15"
+        };
+        // --- END OF CONFIG ---
+
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, setLogLevel } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment (if they exist)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // Use a default for local dev IF config isn't manually pasted
+        const localConfig = (firebaseConfig.apiKey === "AIzaSy...") ? {} : firebaseConfig;
+        // Use __firebase_config if provided by the environment, otherwise use the pasted localConfig
+        const finalFirebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : localConfig;
+
+        // Global App State
+        let db, auth;
+        let userId = null;
+        let gameState = {
+            resources: { glimmer: 100, wood: 50, stone: 20, crystal: 0 }, // <-- ADDED CRYSTAL
+            islandMap: {}, // Stores buildings. E.g., { 'tile-1-1': { type: 'Glimmerbloom', completeTime: 123456789 } }
+            lastUpdated: null
+        };
+        let puzzles = {};
+        let unsubscribe = () => {}; // Function to detach Firestore listener
+        let gameTickInterval = null; // Holds the main game loop timer
+        
+        // Puzzle State
+        let currentPuzzle = null;
+        let currentScore = 0;
+        let puzzleBoard = [];
+
+        // --- DOM Elements ---
+        const loadingScreen = () => document.getElementById('loading-screen');
+        const gameContent = () => document.getElementById('game-content');
+        const userIdDisplay = () => document.getElementById('user-id-display');
+        const glimmerDisplay = () => document.getElementById('glimmer-display');
+        const woodDisplay = () => document.getElementById('wood-display');
+        const stoneDisplay = () => document.getElementById('stone-display');
+        const crystalDisplay = () => document.getElementById('crystal-display'); // <-- ADDED
+        const puzzleModal = () => document.getElementById('puzzle-modal');
+        const puzzleGrid = () => document.getElementById('puzzle-grid');
+        const puzzleTarget = () => document.getElementById('puzzle-target');
+        const puzzleCurrent = () => document.getElementById('puzzle-current');
+        const puzzleMessage = () => document.getElementById('puzzle-message');
+        const buildMenu = () => document.getElementById('build-menu');
+        const islandGrid = () => document.getElementById('island-grid');
+        const modalMessage = () => document.getElementById('modal-message');
+        const modal = () => document.getElementById('modal');
+        const howToPlayModal = () => document.getElementById('how-to-play-modal');
+        const aetherSkyScreen = () => document.getElementById('aether-sky-screen'); 
+        const discoveredIsland = () => document.getElementById('discovered-island'); 
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+        async function initializeFirebase() {
+            try {
+                if (!finalFirebaseConfig || !finalFirebaseConfig.apiKey) {
+                    loadingScreen().innerHTML = `
+                        <div class="text-red-500 p-4 bg-red-100 rounded-lg">
+                            <strong>Error:</strong> Firebase configuration is missing.
+                            <p class="text-sm">Please paste your \`firebaseConfig\` object from the Firebase console into the \`index.html\` file (around line 17) to run this demo locally.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                // setLogLevel('debug'); // Enable for detailed Firebase logging
+                const app = initializeApp(finalFirebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                loadingScreen().querySelector('p').textContent = 'Connecting to the Aether...';
+
+                // Wait for auth state to be finalized
+                onAuthStateChanged(auth, async (user) => {
+                    try {
+                        if (user) {
+                            console.log("User is signed in:", user.uid);
+                            userId = user.uid;
+                            userIdDisplay().textContent = `UserID: ${userId}`;
+                            
+                            // User is signed in, now fetch their data
+                            await setupFirestoreListener(userId);
+
+                        } else if (!userId) { // Only attempt to sign in if we aren't already
+                            console.log("No user signed in. Attempting anonymous sign-in...");
+                            
+                            // Check for initial auth token (for Canvas environment)
+                            if (typeof __initial_auth_token !== 'undefined') {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                            } else {
+                                // Fallback to anonymous sign-in for local dev
+                                await signInAnonymously(auth);
+                            }
+                        }
+                    } catch (authError) {
+                        console.error("Error during onAuthStateChanged or anonymous sign-in:", authError);
+                        loadingScreen().innerHTML = `
+                            <div class="text-red-500 p-4 bg-red-100 rounded-lg">
+                                <strong>Auth Error:</strong> ${authError.message}
+                                <p class="text-sm mt-2">This usually means <strong>'Anonymous' sign-in is not enabled</strong> in your Firebase project.</p>
+                                <p class="text-xs mt-1">Please go to Firebase Console -> Authentication -> Sign-in method -> Enable 'Anonymous' and click Save.</p>
+                            </div>
+                        `;
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                loadingScreen().innerHTML = `
+                    <div class="text-red-500 p-4 bg-red-100 rounded-lg">
+                        <strong>Error initializing Firebase.</strong>
+                        <p class="text-sm mt-2">Details: ${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        // --- FIREBASE DATA HANDLING ---
+        async function setupFirestoreListener(uid) {
+            loadingScreen().querySelector('p').textContent = 'Finding your island...';
+            // Use the correct path for private user data
+            const userDocRef = doc(db, "artifacts", appId, "users", uid);
+
+            // Use onSnapshot to listen for real-time updates
+            unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    console.log("Game state loaded from Firestore.");
+                    gameState = docSnap.data();
+                    // Ensure nested objects exist
+                    if (!gameState.resources) gameState.resources = { glimmer: 100, wood: 50, stone: 20, crystal: 0 };
+                    // Add crystal if it's missing from an old save
+                    if (gameState.resources.crystal === undefined) gameState.resources.crystal = 0;
+                    if (!gameState.islandMap) gameState.islandMap = {};
+                } else {
+                    console.log("No save data found. Creating new game state.");
+                    // gameState is already default, so we just save it
+                    saveGameState();
+                }
+                
+                // Once data is loaded (or created), start the game
+                startGame();
+            }, (error) => {
+                console.error("Error with Firestore snapshot:", error);
+                loadingScreen().innerHTML = `
+                    <div class="text-red-500 p-4 bg-red-100 rounded-lg">
+                        <strong>Firestore Error:</strong> ${error.message}
+                        <p class="text-sm mt-2">This usually means your <strong>Firestore Security Rules</strong> are blocking access.</p>
+                        <p class="text-xs mt-1">Please ensure your database is in 'test mode' or allows reads/writes for authenticated users.</p>
+                    </div>
+                `;
+            });
+        }
+
+        async function saveGameState() {
+            if (!userId || !db) {
+                console.warn("Cannot save game state: user or db not initialized.");
+                return;
+            }
+            try {
+                gameState.lastUpdated = new Date().toISOString();
+                const userDocRef = doc(db, "artifacts", appId, "users", userId);
+                await setDoc(userDocRef, gameState, { merge: true }); // Use merge:true to avoid overwriting
+                console.log("Game state saved.");
+            } catch (error) {
+                console.error("Error saving game state:", error);
+            }
+        }
+
+        // --- GAME START & MAIN LOOP ---
+        function startGame() {
+            console.log("Starting game...");
+            // Stop any previous game tick
+            if (gameTickInterval) clearInterval(gameTickInterval);
+
+            // Start the main game tick (runs every second)
+            gameTickInterval = setInterval(gameTick, 1000);
+
+            // Initial render
+            updateResourceUI();
+            renderIslandMap();
+            renderBuildMenu(); // Render this once to populate
+            document.getElementById('build-menu-placeholder').classList.remove('hidden');
+
+
+            // Hide loading screen, show game
+            loadingScreen().classList.add('hidden');
+            gameContent().classList.remove('hidden');
+        }
+
+        // --- GAME TICK (Runs 1x per second) ---
+        function gameTick() {
+            const now = Date.now();
+            let stateChanged = false;
+
+            // Check for completed buildings
+            for (const tileId in gameState.islandMap) {
+                const building = gameState.islandMap[tileId];
+                // Check if building is in progress and completeTime has passed
+                if (building && building.completeTime && now >= building.completeTime) {
+                    console.log(`Building ${building.type} at ${tileId} is complete!`);
+                    // Mark as complete by removing the time
+                    delete building.completeTime;
+                    
+                    // TODO: Add permanent resource generation logic here
+                    // e.g., gameState.resources.glimmer += building.productionRate;
+                    
+                    stateChanged = true;
+                }
+            }
+
+            // TODO: Add resource generation from completed buildings
+            // e.g., gameState.resources.glimmer += gameState.glimmerPerSecond;
+
+            if (stateChanged) {
+                renderIslandMap(); // Re-draw map to show completed buildings
+                updateResourceUI(); // Update UI if resources were generated
+                // We save state when a building completes
+                saveGameState(); 
+            }
+
+            // Update timers on any active building sites
+            updateBuildingTimers();
+        }
+
+        // --- UI RENDERING ---
+        function updateResourceUI() {
+            if (!gameState.resources) return; // Guard clause
+            glimmerDisplay().textContent = gameState.resources.glimmer;
+            woodDisplay().textContent = gameState.resources.wood;
+            stoneDisplay().textContent = gameState.resources.stone;
+            crystalDisplay().textContent = gameState.resources.crystal; // <-- ADDED
+        }
+
+        function renderIslandMap() {
+            islandGrid().innerHTML = '';
+            // Create a 5x5 grid
+            for (let r = 0; r < 5; r++) {
+                for (let c = 0; c < 5; c++) {
+                    const tileId = `tile-${r}-${c}`;
+                    const building = gameState.islandMap[tileId];
+                    const tile = document.createElement('div');
+                    tile.id = tileId;
+                    tile.className = 'w-16 h-16 sm:w-20 sm:h-20 border-2 border-green-700/30 rounded-lg flex items-center justify-center text-3xl select-none';
+                    
+                    if (building) {
+                        if (building.completeTime) {
+                            // Building is in progress
+                            tile.innerHTML = `
+                                <div class="relative w-full h-full">
+                                    <div class="absolute inset-0 flex items-center justify-center opacity-30">${puzzles[building.type].icon}</div>
+                                    <div class="absolute inset-0 flex items-center justify-center text-sm font-bold text-white bg-black/50 rounded-lg" data-timer-for="${tileId}">
+                                        ...
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            // Building is complete
+                            tile.innerHTML = puzzles[building.type].icon;
+                            tile.classList.add('bg-green-500/30');
+                        }
+                    } else {
+                        // Empty tile
+                        tile.innerHTML = '🌱';
+                        tile.classList.add('bg-green-900/50', 'cursor-pointer', 'hover:bg-green-700/50');
+                        tile.onclick = () => showBuildMenu(tileId);
+                    }
+                    islandGrid().appendChild(tile);
+                }
+            }
+            updateBuildingTimers();
+        }
+
+        function updateBuildingTimers() {
+            const now = Date.now();
+            document.querySelectorAll('[data-timer-for]').forEach(timerEl => {
+                const tileId = timerEl.dataset.timerFor;
+                const building = gameState.islandMap[tileId];
+                if (building && building.completeTime) {
+                    const remaining = Math.max(0, building.completeTime - now);
+                    const seconds = Math.floor((remaining / 1000) % 60);
+                    const minutes = Math.floor((remaining / (1000 * 60)) % 60);
+                    timerEl.textContent = `${minutes}m ${seconds}s`;
+                } else {
+                    timerEl.textContent = 'Done!'; // Should be caught by gameTick, but as a fallback
+                }
+            });
+        }
+
+        function renderBuildMenu() {
+            buildMenu().innerHTML = '';
+            // Get all puzzle types and sort them by level
+            const sortedPuzzles = Object.values(puzzles).sort((a, b) => a.level - b.level);
+
+            for (const puzzle of sortedPuzzles) {
+                const button = document.createElement('button');
+                button.className = 'w-full p-3 bg-gray-700 border border-gray-600 rounded-lg flex items-center justify-between text-left hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed';
+                button.innerHTML = `
+                    <div>
+                        <span class"text-xs text-gray-400">Lvl ${puzzle.level}</span>
+                        <span class="text-2xl ml-2">${puzzle.icon}</span>
+                        <span class="ml-3 text-lg">${puzzle.name}</span>
+                    </div>
+                    <div class="text-right text-sm space-y-0.5">
+                        ${puzzle.cost.glimmer > 0 ? `<div>✨ ${puzzle.cost.glimmer}</div>` : ''}
+                        ${puzzle.cost.wood > 0 ? `<div>🪵 ${puzzle.cost.wood}</div>` : ''}
+                        ${puzzle.cost.stone > 0 ? `<div>🪨 ${puzzle.cost.stone}</div>` : ''}
+                        ${puzzle.cost.crystal > 0 ? `<div>💎 ${puzzle.cost.crystal}</div>` : ''}
+                        <div class="text-xs text-gray-400">${puzzle.buildTime / 1000}s</div>
+                    </div>
+                `;
+                // Disable button if not enough resources
+                if (gameState.resources.glimmer < puzzle.cost.glimmer ||
+                    gameState.resources.wood < puzzle.cost.wood ||
+                    gameState.resources.stone < puzzle.cost.stone ||
+                    gameState.resources.crystal < puzzle.cost.crystal) {
+                    button.disabled = true;
+                }
+                button.onclick = () => window.startPuzzle(puzzle.name); // Use name as unique key
+                buildMenu().appendChild(button);
+            }
+        }
+
+        function showBuildMenu(tileId) {
+            // Store which tile was clicked
+            buildMenu().dataset.tileId = tileId;
+            // Refresh menu to show correct disabled states
+            renderBuildMenu();
+            // Show the menu and hide placeholder
+            buildMenu().classList.remove('hidden');
+            document.getElementById('build-menu-placeholder').classList.add('hidden');
+        }
+
+        // --- ACTION LOOP: PUZZLE GAME ---
+
+        function definePuzzles() {
+            puzzles = {
+                'Glimmerbloom': {
+                    name: 'Glimmerbloom',
+                    icon: '🌸',
+                    level: 1,
+                    cost: { glimmer: 50, wood: 0, stone: 0, crystal: 0 },
+                    reward: { glimmer: 100, wood: 10, stone: 5, crystal: 0 },
+                    buildTime: 10 * 1000, // 10 seconds
+                    targetResonance: 150,
+                    gridSize: 5,
+                    colors: ['🌸', '💧', '☀️']
+                },
+                'Woodshroom': {
+                    name: 'Woodshroom',
+                    icon: '🍄',
+                    level: 2,
+                    cost: { glimmer: 20, wood: 30, stone: 0, crystal: 0 },
+                    reward: { glimmer: 20, wood: 50, stone: 10, crystal: 0 },
+                    buildTime: 60 * 1000, // 1 minute
+                    targetResonance: 250,
+                    gridSize: 6,
+                    colors: ['🍄', '💧', '☀️', '🍃']
+                },
+                // --- NEW LEVELS ---
+                'StoneSpire': {
+                    name: 'StoneSpire',
+                    icon: '🪨',
+                    level: 3,
+                    cost: { glimmer: 100, wood: 50, stone: 30, crystal: 0 },
+                    reward: { glimmer: 50, wood: 50, stone: 100, crystal: 1 }, // Gives 1 crystal!
+                    buildTime: 5 * 60 * 1000, // 5 minutes
+                    targetResonance: 400,
+                    gridSize: 6,
+                    colors: ['🪨', '💧', '☀️', '🍃', '🌸'] // More colors
+                },
+                'Crystalight': {
+                    name: 'Crystalight',
+                    icon: '💎',
+                    level: 4,
+                    cost: { glimmer: 50, wood: 20, stone: 50, crystal: 5 }, // Requires crystal
+                    reward: { glimmer: 100, wood: 50, stone: 50, crystal: 5 },
+                    buildTime: 15 * 60 * 1000, // 15 minutes
+                    targetResonance: 700,
+                    gridSize: 7, // Bigger grid
+                    colors: ['💎', '💧', '☀️', '🍃', '🌸', '🍄']
+                },
+                'SunpetalBank': {
+                    name: 'SunpetalBank',
+                    icon: '🌻',
+                    level: 5,
+                    cost: { glimmer: 200, wood: 100, stone: 100, crystal: 10 },
+                    reward: { glimmer: 500, wood: 200, stone: 200, crystal: 10 },
+                    buildTime: 60 * 60 * 1000, // 1 hour
+                    targetResonance: 1200,
+                    gridSize: 7,
+                    colors: ['🌻', '💧', '☀️', '🍃', '🌸', '🍄', '💎'] // All colors
+                }
+            };
+        }
+
+        window.startPuzzle = (puzzleName) => {
+            currentPuzzle = puzzles[puzzleName];
+            currentScore = 0;
+
+            // Check if player can afford it
+            if (gameState.resources.glimmer < currentPuzzle.cost.glimmer ||
+                gameState.resources.wood < currentPuzzle.cost.wood ||
+                gameState.resources.stone < currentPuzzle.cost.stone ||
+                gameState.resources.crystal < currentPuzzle.cost.crystal) {
+                showMessage("You don't have enough resources to start this!");
+                return;
+            }
+
+            // Deduct cost
+            gameState.resources.glimmer -= currentPuzzle.cost.glimmer;
+            gameState.resources.wood -= currentPuzzle.cost.wood;
+            gameState.resources.stone -= currentPuzzle.cost.stone;
+            gameState.resources.crystal -= currentPuzzle.cost.crystal;
+            updateResourceUI();
+            saveGameState(); // Save after deducting cost
+
+            // Setup puzzle UI
+            document.getElementById('puzzle-title').textContent = `Find ${currentPuzzle.name}`;
+            puzzleTarget().textContent = currentPuzzle.targetResonance;
+            puzzleCurrent().textContent = currentScore;
+            puzzleMessage().classList.add('hidden');
+            
+            // Generate board
+            generatePuzzleBoard();
+            
+            // Show puzzle
+            puzzleModal().classList.remove('hidden');
+        }
+
+        function generatePuzzleBoard() {
+            puzzleBoard = [];
+            puzzleGrid().innerHTML = '';
+            puzzleGrid().style.gridTemplateColumns = `repeat(${currentPuzzle.gridSize}, 1fr)`;
+            
+            for (let r = 0; r < currentPuzzle.gridSize; r++) {
+                const row = [];
+                for (let c = 0; c < currentPuzzle.gridSize; c++) {
+                    const randomColor = currentPuzzle.colors[Math.floor(Math.random() * currentPuzzle.colors.length)];
+                    row.push(randomColor);
+                    
+                    const cell = document.createElement('div');
+                    // Adjust text size for smaller grids
+                    const textSize = currentPuzzle.gridSize > 6 ? 'text-2xl sm:text-3xl' : 'text-3xl sm:text-4xl';
+                    cell.className = `aspect-square flex items-center justify-center ${textSize} bg-gray-700/50 rounded hover:bg-gray-600/50 cursor-pointer transition-all duration-100`;
+                    cell.textContent = randomColor;
+                    cell.dataset.r = r;
+                    cell.dataset.c = c;
+                    cell.onclick = () => onPuzzleTap(r, c);
+                    puzzleGrid().appendChild(cell);
+                }
+                puzzleBoard.push(row);
+            }
+        }
+
+        function onPuzzleTap(r, c) {
+            const color = puzzleBoard[r][c];
+            if (!color) return; // Already cleared
+
+            const group = findGroup(r, c, color);
+            
+            if (group.size < 3) {
+                // Not a valid move
+                puzzleMessage().textContent = 'Find a group of 3 or more!';
+                puzzleMessage().classList.remove('hidden', 'text-green-400');
+                puzzleMessage().classList.add('text-red-400');
+                return;
+            }
+
+            // Valid move
+            puzzleMessage().classList.add('hidden');
+            
+            // Calculate score (e.g., 10 points per block, squared bonus)
+            const score = 10 * group.size + Math.pow(group.size - 3, 2);
+            currentScore += score;
+            puzzleCurrent().textContent = currentScore;
+
+            // Clear blocks
+            group.forEach(id => {
+                const [rr, cc] = id.split('-').map(Number);
+                puzzleBoard[rr][cc] = null;
+            });
+            
+            // Apply gravity
+            applyGravity();
+            
+            // Redraw
+            redrawPuzzleBoard();
+
+            // Check for win
+            if (currentScore >= currentPuzzle.targetResonance) {
+                winPuzzle();
+            }
+        }
+
+        function findGroup(r, c, color) {
+            const group = new Set();
+            const stack = [`${r}-${c}`];
+            group.add(`${r}-${c}`);
+            
+            const size = currentPuzzle.gridSize;
+
+            while (stack.length > 0) {
+                const [cr, cc] = stack.pop().split('-').map(Number);
+                
+                // Check neighbors
+                const neighbors = [
+                    [cr - 1, cc], [cr + 1, cc], [cr, cc - 1], [cr, cc + 1]
+                ];
+                
+                for (const [nr, nc] of neighbors) {
+                    const id = `${nr}-${nc}`;
+                    if (nr >= 0 && nr < size && nc >= 0 && nc < size && // Check bounds
+                        puzzleBoard[nr][nc] === color && !group.has(id)) {
+                        group.add(id);
+                        stack.push(id);
+                    }
+                }
+            }
+            return group;
+        }
+
+        function applyGravity() {
+            const size = currentPuzzle.gridSize;
+            for (let c = 0; c < size; c++) {
+                let emptyRow = size - 1;
+                // Move from bottom up
+                for (let r = size - 1; r >= 0; r--) {
+                    if (puzzleBoard[r][c] !== null) {
+                        // Found a block, move it to the lowest empty row
+                        [puzzleBoard[emptyRow][c], puzzleBoard[r][c]] = [puzzleBoard[r][c], puzzleBoard[emptyRow][c]];
+                        emptyRow--;
+                    }
+                }
+                // Fill remaining empty spots at the top
+                for (let r = emptyRow; r >= 0; r--) {
+                    puzzleBoard[r][c] = currentPuzzle.colors[Math.floor(Math.random() * currentPuzzle.colors.length)];
+                }
+            }
+        }
+
+        function redrawPuzzleBoard() {
+            const cells = puzzleGrid().children;
+            for (let r = 0; r < currentPuzzle.gridSize; r++) {
+                for (let c = 0; c < currentPuzzle.gridSize; c++) {
+                    const index = r * currentPuzzle.gridSize + c;
+                    cells[index].textContent = puzzleBoard[r][c];
+                    cells[index].style.opacity = puzzleBoard[r][c] ? 1 : 0;
+                }
+            }
+        }
+
+        function winPuzzle() {
+            puzzleMessage().textContent = 'Resonance Achieved!';
+            puzzleMessage().classList.remove('hidden', 'text-red-400');
+            puzzleMessage().classList.add('text-green-400');
+            
+            // Disable the puzzle grid so the user can't keep tapping
+            puzzleGrid().style.pointerEvents = 'none';
+
+            // Get the tileId *before* the timeout
+            const tileId = buildMenu().dataset.tileId;
+
+            // NEW FLOW: Instead of closing, "warp" to the Aether Sky
+            setTimeout(() => {
+                // Hide puzzle and main game
+                puzzleModal().classList.add('hidden');
+                gameContent().classList.add('hidden');
+
+                // Show Aether Sky
+                aetherSkyScreen().classList.remove('hidden');
+                
+                // Setup the new discovered island
+                discoveredIsland().innerHTML = `
+                    <div class="text-center">
+                        <div class="text-7xl animate-float">${currentPuzzle.icon}</div>
+                        <p class="mt-4 text-xl font-semibold">${currentPuzzle.name} Isle</p>
+                        <p class="text-gray-300">Tap to Collect!</p>
+                    </div>
+                `;
+                // Set the action for collecting the island
+                discoveredIsland().onclick = () => collectDiscoveredIsland(tileId);
+
+                // Reset puzzle grid for next time
+                puzzleGrid().style.pointerEvents = 'auto';
+
+            }, 1500); // Wait 1.5s after "Resonance Achieved"
+        }
+
+        // --- NEW FUNCTION for collecting the discovered island ---
+        function collectDiscoveredIsland(tileId) {
+            // Hide Aether Sky and show the main game again
+            aetherSkyScreen().classList.add('hidden');
+            gameContent().classList.remove('hidden');
+
+            // --- Now we apply all the rewards and building logic ---
+            
+            // Add rewards
+            gameState.resources.glimmer += currentPuzzle.reward.glimmer;
+            gameState.resources.wood += currentPuzzle.reward.wood;
+            gameState.resources.stone += currentPuzzle.reward.stone;
+            gameState.resources.crystal += currentPuzzle.reward.crystal;
+            
+            // Place the building
+            if (tileId) {
+                gameState.islandMap[tileId] = {
+                    type: currentPuzzle.name,
+                    completeTime: Date.now() + currentPuzzle.buildTime
+                };
+                console.log(`Starting build for ${currentPuzzle.name} at ${tileId}`);
+            }
+
+            // Update UI & Save
+            updateResourceUI();
+            renderIslandMap();
+            renderBuildMenu(); // This will re-render, hiding buttons if resources are now too low
+            saveGameState();
+            
+            // Hide menu and show placeholder
+            buildMenu().classList.add('hidden');
+            document.getElementById('build-menu-placeholder').classList.remove('hidden');
+        }
+
+        window.closePuzzle = () => {
+            puzzleModal().classList.add('hidden');
+        }
+
+        // --- META LOOP: BUILDING ---
+        window.showMessage = (message) => {
+            modalMessage().textContent = message;
+            modal().classList.remove('hidden');
+        }
+        window.closeModal = () => {
+            modal().classList.add('hidden');
+        }
+
+        // --- HOW TO PLAY MODAL ---
+        window.openHowToPlay = () => {
+            howToPlayModal().classList.remove('hidden');
+        }
+        window.closeHowToPlay = () => {
+            howToPlayModal().classList.add('hidden');
+        }
+        
+        // --- INIT ---
+        window.onload = () => {
+            definePuzzles();
+            initializeFirebase();
+        }
+
+    </script>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans h-screen flex items-center justify-center">
+
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="text-center p-4">
+        <div class="text-4xl animate-pulse">✨</div>
+        <p class="mt-4 text-lg text-gray-400">Loading Game Data...</p>
+    </div>
+
+    <!-- Main Game Content (Hidden by default) -->
+    <div id="game-content" class="hidden w-full h-full flex flex-col">
+        
+        <!-- Header: Resources -->
+        <header class="bg-gray-800/80 backdrop-blur-sm p-3 sticky top-0 z-10">
+            <div class="container mx-auto max-w-4xl flex justify-between items-center">
+                <div class="flex items-center space-x-4">
+                    <h1 class="text-xl font-bold text-green-400">Aether Blooms</h1>
+                    <button onclick="openHowToPlay()" class="text-sm bg-blue-600/50 hover:bg-blue-500/50 text-white py-1 px-3 rounded-lg">
+                        How to Play
+                    </button>
+                </div>
+                <!-- UPDATED TO BE FLEXIBLE AND INCLUDE CRYSTALS -->
+                <div class="flex flex-wrap justify-end gap-2">
+                    <div class="flex items-center p-2 bg-gray-700/50 rounded-lg">
+                        <span class="text-2xl">✨</span>
+                        <span id="glimmer-display" class="ml-2 font-bold text-lg">0</span>
+                    </div>
+                    <div class="flex items-center p-2 bg-gray-700/50 rounded-lg">
+                        <span class="text-2xl">🪵</span>
+                        <span id="wood-display" class="ml-2 font-bold text-lg">0</span>
+                    </div>
+                    <div class="flex items-center p-2 bg-gray-700/50 rounded-lg">
+                        <span class="text-2xl">🪨</span>
+                        <span id="stone-display" class="ml-2 font-bold text-lg">0</span>
+                    </div>
+                    <div class="flex items-center p-2 bg-gray-700/50 rounded-lg">
+                        <span class="text-2xl">💎</span>
+                        <span id="crystal-display" class="ml-2 font-bold text-lg">0</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="flex-1 overflow-auto p-4 container mx-auto max-w-4xl">
+            <div class="flex flex-col md:flex-row gap-6">
+
+                <!-- Left Panel: Island Grid -->
+                <div class="flex-1">
+                    <h2 class="text-2xl font-semibold mb-4 text-green-300">Your Living Isle</h2>
+                    <div id="island-grid" class="grid grid-cols-5 gap-1.5 bg-black/30 p-2 rounded-lg">
+                        <!-- Tiles are generated by JS -->
+                    </div>
+                    <p id="user-id-display" class="text-xs text-gray-500 mt-4">UserID: (connecting...)</p>
+                </div>
+
+                <!-- Right Panel: Build Menu -->
+                <div class="w-full md:w-64 lg:w-80">
+                    <h2 class="text-2xl font-semibold mb-4 text-blue-300">Build</h2>
+                    <div id="build-menu-placeholder" class="text-center text-gray-400 p-4 bg-gray-800/50 rounded-lg">
+                        Tap an empty '🌱' plot on your island to build.
+                    </div>
+                    <div id="build-menu" class="hidden space-y-2">
+                        <!-- Build options are generated by JS -->
+                    </div>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Puzzle Modal -->
+    <div id="puzzle-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-40 flex items-center justify-center p-4">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-2xl w-full max-w-sm border border-gray-700">
+            <h2 id="puzzle-title" class="text-2xl font-bold text-center mb-4">Puzzle Time!</h2>
+            
+            <div class="flex justify-around mb-4">
+                <div class="text-center">
+                    <div class="text-sm text-gray-400">TARGET</div>
+                    <div id="puzzle-target" class="text-2xl font-bold text-green-400">0</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-sm text-gray-400">CURRENT</div>
+                    <div id="puzzle-current" class="text-2xl font-bold text-white">0</div>
+                </div>
+            </div>
+
+            <div id="puzzle-grid" class="grid grid-cols-5 gap-1 bg-black/30 p-2 rounded-lg aspect-square">
+                <!-- Puzzle grid cells generated by JS -->
+            </div>
+
+            <p id="puzzle-message" class="text-center font-bold mt-4 h-6"></p>
+        </div>
+    </div>
+
+    <!-- Generic Message Modal -->
+    <div id="modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-2xl w-full max-w-sm border border-gray-700">
+            <h2 class="text-xl font-bold text-center mb-4">Notice</h2>
+            <p id="modal-message" class="text-center text-gray-300 mb-6">This is a message.</p>
+            <button onclick="closeModal()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-4 rounded-lg">
+                OK
+            </button>
+        </div>
+    </div>
+
+    <!-- How to Play Modal -->
+    <div id="how-to-play-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-2xl w-full max-w-lg border border-gray-700">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-blue-300">How to Play</h2>
+                <button onclick="closeHowToPlay()" class="text-gray-400 hover:text-white text-3xl leading-none">&times;</button>
+            </div>
+            
+            <ol class="list-decimal list-inside space-y-4 text-gray-200">
+                <li>
+                    <strong class="text-white">Tap an empty plot</strong>
+                    <p class="text-sm text-gray-400 ml-5">Find a '🌱' tile on your island and tap it to open the build menu.</p>
+                </li>
+                <li>
+                    <strong class="text-white">Choose a Building</strong>
+                    <p class="text-sm text-gray-400 ml-5">Click a building from the "Build" menu (like '🌸 Glimmerbloom') to start the puzzle.</p>
+                </li>
+                <li>
+                    <strong class="text-white">Solve the Puzzle</strong>
+                    <p class="text-sm text-gray-400 ml-5">Tap groups of 3 or more matching emoji to score points. Reach the "TARGET" score to win.</p>
+                </li>
+                <li>
+                    <strong class="text-white">Discover & Collect</strong>
+                    <p class="text-sm text-gray-400 ml-5">When you win, you'll discover a new island! Tap it to collect your rewards.</p>
+                </li>
+                <li>
+                    <strong class="text-white">Build & Grow</strong>
+                    <p class="text-sm text-gray-400 ml-5">Your new island will be placed on your home grid and its build timer will start. Wait for it to finish, then build more!</p>
+                </li>
+            </ol>
+
+            <button onclick="closeHowToPlay()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-4 rounded-lg mt-8">
+                Got It!
+            </button>
+        </div>
+    </div>
+
+    <!-- NEW: Aether Sky Discovery Screen -->
+    <div id="aether-sky-screen" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 bg-gradient-to-b from-blue-300 to-indigo-500">
+        <div class="text-center text-white">
+            <h2 class="text-3xl font-bold mb-8 text-shadow-lg">You discovered a new island!</h2>
+            
+            <button id="discovered-island" class="bg-white/20 hover:bg-white/30 backdrop-blur-md p-10 rounded-2xl shadow-xl border border-white/30">
+                <!-- Content set by JS -->
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
